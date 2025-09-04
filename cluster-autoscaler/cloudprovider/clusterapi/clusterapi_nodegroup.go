@@ -138,6 +138,18 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 		return fmt.Errorf("unable to delete %d machines in %q, machine replicas are %q, minSize is %q ", len(nodes), ng.Id(), replicas, ng.MinSize())
 	}
 
+	// Option 1: Trying to detect if a MD rollout is in progress
+	// This seems more robust or less racy than Option 0, because it does not rely on two controllers doing their work
+	// it just relies on one.
+	// This option will only affect rollouts, while Option 0 might have side effects outside of rollouts
+	isMachineDeploymentAndRollingOut, err := ng.isMachineDeploymentAndRollingOut()
+	if err != nil {
+		return err
+	}
+	if isMachineDeploymentAndRollingOut {
+		return nil
+	}
+
 	// Step 3: annotate the corresponding machine that it is a
 	// suitable candidate for deletion and drop the replica count
 	// by 1. Fail fast on any error.
@@ -156,6 +168,15 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 			// The machine for this node is already being deleted
 			continue
 		}
+
+		// Option 0
+		// Continue for cases where we now that CAPI is going to delete the Machine
+		// * Machine is outdated (e.g. part of the old MS)
+		// * Also Remediation but let's handle this separately as a follow-up
+
+		// Continue for cases where we know that some workload in the nodegroup will be relocated ("based on CAPI actions", e.g. drain Machine)
+		// * other Machines in the same nodegroup are in deleting
+		// * other Machines in the same nodegroup are outdated or going to be remediated (i.e. are going to be deleted)
 
 		nodeGroup, err := ng.machineController.nodeGroupForNode(node)
 		if err != nil {
@@ -176,6 +197,22 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 
 	return nil
 }
+
+// autoscaler wants    | MD does afterwards
+// delete old Machine  | delete old Machine => might be broken if wrong MS
+// delete new Machine  | delete new Machine => fine
+// delete old Machine  | delete new Machine => broken
+// delete new Machine  | delete old Machine => broken
+
+// Notes:
+// * maybe we also want to block downscale for Machines that are going to be remediated
+
+// How do we detect rollout?
+// Option 1.1: are there old MachineSets with max(spec.replicas, status.replicas) >= 1
+// => get MachineSets, ignore the one with the highest revision => check if any max(spec.replicas, status.replicas) >= 1
+// Option 1.2: if MS >= 2, >=1 replica => rollout => this doesn't work with maxSurge 0 as new MS will have 0 replicas
+// Option 1.3: if new MS replicas != MD replicas => also would block during scale up/down
+// Option 1.4: MD.spec.replicas != MD.status.upToDateReplicas => more racy, slightly different for v1beta1 / v1beta2
 
 // ForceDeleteNodes deletes nodes from the group regardless of constraints.
 func (ng *nodegroup) ForceDeleteNodes(nodes []*corev1.Node) error {
@@ -456,6 +493,68 @@ func (ng *nodegroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*c
 	}
 
 	return &defaults, nil
+}
+
+func (ng *nodegroup) isMachineDeploymentAndRollingOut() (bool, error) {
+	if ng.scalableResource.unstructured.GetKind() != machineDeploymentKind {
+		// Not a MachineDeployment.
+		return false, nil
+	}
+
+	machineSets, err := ng.machineController.listMachineSetsForMachineDeployment(ng.scalableResource.unstructured)
+	if err != nil {
+		return false, err
+	}
+
+	if len(machineSets) == 0 {
+		// No MachineSets => MD is not rolling out.
+		return false, nil
+	}
+
+	// Find the latest revision, the MachineSet with the latest revision is the MachineSet that
+	// matches the MachineDeployment spec.
+	var latestMSRevisionInt int64
+	for _, ms := range machineSets {
+		msRevision, ok := ms.GetAnnotations()["machinedeployment.clusters.x-k8s.io/revision"]
+		if !ok {
+			continue
+		}
+
+		msRevisionInt, err := strconv.ParseInt(msRevision, 10, 64)
+		if err != nil {
+			return false, errors.Wrapf(err, "failed to parse current revision on MachineSet %s", klog.KObj(ms))
+		}
+		latestMSRevisionInt = max(latestMSRevisionInt, msRevisionInt)
+	}
+	maxMSRevision := strconv.FormatInt(latestMSRevisionInt, 10)
+
+	for _, ms := range machineSets {
+		if ms.GetAnnotations()["machinedeployment.clusters.x-k8s.io/revision"] == maxMSRevision {
+			// Ignore the MachineSet with the latest revision
+			continue
+		}
+
+		// Check if any of the old MachineSets still have replicas
+		replicas, found, err := unstructured.NestedInt64(ms.UnstructuredContent(), "spec", "replicas")
+		if err != nil {
+			return false, err
+		}
+		if found && replicas > 0 {
+			// Found old MachineSets that still has replicas => MD is still rolling out.
+			return true, nil
+		}
+		replicas, found, err = unstructured.NestedInt64(ms.UnstructuredContent(), "status", "replicas")
+		if err != nil {
+			return false, err
+		}
+		if found && replicas > 0 {
+			// Found old MachineSets that still has replicas => MD is still rolling out.
+			return true, nil
+		}
+	}
+
+	// Didn't find any old MachineSets that still have replicas => MD is not rolling out.
+	return false, nil
 }
 
 func newNodeGroupFromScalableResource(controller *machineController, unstructuredScalableResource *unstructured.Unstructured) (*nodegroup, error) {
