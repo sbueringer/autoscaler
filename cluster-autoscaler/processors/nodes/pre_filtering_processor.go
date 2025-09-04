@@ -57,6 +57,18 @@ func (n *PreFilteringScaleDownNodeProcessor) GetScaleDownCandidates(ctx *context
 			klog.V(5).Infof("Node %s should not be processed by cluster autoscaler (no node group config)", node.Name)
 			continue
 		}
+
+		mdNodeGroup, ok := nodeGroup.(interface{ IsMachineDeploymentAndRollingOut() (bool, error) })
+		if ok {
+			isMachineDeploymentAndRollingOut, err := mdNodeGroup.IsMachineDeploymentAndRollingOut()
+			if err != nil {
+				continue
+			}
+			if isMachineDeploymentAndRollingOut {
+				continue
+			}
+		}
+
 		size, found := nodeGroupSize[nodeGroup.Id()]
 		if !found {
 			klog.Errorf("Error while checking node group size %s: group size not found", nodeGroup.Id())

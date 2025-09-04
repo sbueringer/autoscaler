@@ -142,13 +142,13 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 	// This seems more robust or less racy than Option 0, because it does not rely on two controllers doing their work
 	// it just relies on one.
 	// This option will only affect rollouts, while Option 0 might have side effects outside of rollouts
-	isMachineDeploymentAndRollingOut, err := ng.isMachineDeploymentAndRollingOut()
-	if err != nil {
-		return err
-	}
-	if isMachineDeploymentAndRollingOut {
-		return nil
-	}
+	//isMachineDeploymentAndRollingOut, err := ng.IsMachineDeploymentAndRollingOut()
+	//if err != nil {
+	//	return err
+	//}
+	//if isMachineDeploymentAndRollingOut {
+	//	return nil
+	//}
 
 	// Step 3: annotate the corresponding machine that it is a
 	// suitable candidate for deletion and drop the replica count
@@ -495,7 +495,7 @@ func (ng *nodegroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*c
 	return &defaults, nil
 }
 
-func (ng *nodegroup) isMachineDeploymentAndRollingOut() (bool, error) {
+func (ng *nodegroup) IsMachineDeploymentAndRollingOut() (bool, error) {
 	if ng.scalableResource.unstructured.GetKind() != machineDeploymentKind {
 		// Not a MachineDeployment.
 		return false, nil
